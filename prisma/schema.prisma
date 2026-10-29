@@ -1,0 +1,80 @@
+datasource db {
+  provider = "postgresql"
+  model      = "prisma"
+  url       = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id             String      @id @default(cuid())
+  email          String      @unique
+  name           String?
+  createdAt      DateTime    @default(now())
+  favorites      Favorite[]
+  trades         Trade[]
+  watchlists     Watchlist[]
+}
+
+model Watchlist {
+  id        String   @id @default(cuid())
+  name      String
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  assets    Favorite[]
+  createdAt DateTime @default(now())
+}
+
+model Favorite {
+  id         String     @id @default(cuid())
+  symbol     String
+  assetClass String
+  userId     String
+  user       User       @relation(fields: [userId], references: [id])
+  watchlistId String?
+  watchlist  Watchlist? @relation(fields: [watchlistId], references: [id])
+  createdAt  DateTime   @default(now())
+}
+
+model Trade {
+  id            String   @id @default(cuid())
+  symbol        String
+  direction     String
+  setupType     String
+  score         Float
+  entryPrice    Float?
+  stopLoss      Float?
+  takeProfit    Float?
+  status        String   @default("open")
+  resultPnl     Float?
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model MarketSignal {
+  id            String   @id @default(cuid())
+  symbol        String
+  assetClass    String
+  direction     String
+  score         Float
+  setupType     String
+  confidence    Float
+  rationale     String
+  marketState   String
+  createdAt     DateTime @default(now())
+}
+
+model LearningSnapshot {
+  id            String   @id @default(cuid())
+  date          DateTime @default(now())
+  setupType     String
+  assetClass    String
+  winRate       Float
+  averageRr     Float
+  sampleSize    Int
+  adjustedScore Float
+}
