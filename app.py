@@ -1,5 +1,6 @@
-import os
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -8,9 +9,13 @@ import streamlit as st
 
 st.set_page_config(page_title="Claude Trading Bot", page_icon="📈", layout="wide")
 
+APP_DIR = Path(__file__).resolve().parent
+FAVORITES_PATH = APP_DIR / "favorites.json"
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
 TOP_COINS = ["bitcoin", "ethereum", "solana", "ripple", "dogecoin", "cardano"]
 BINANCE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT"]
-FAVORITES = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "NVDA"}
+DEFAULT_FAVORITES = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NVDA"]
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -18,7 +23,34 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 
 
 def normalize_symbol(value: str) -> str:
-    return (value or "").upper()
+    return (value or "").upper().strip()
+
+
+def load_favorites() -> list[str]:
+    try:
+        if FAVORITES_PATH.exists():
+            data = json.loads(FAVORITES_PATH.read_text())
+            if isinstance(data, list):
+                return [normalize_symbol(item) for item in data if item]
+    except Exception:
+        pass
+    return DEFAULT_FAVORITES.copy()
+
+
+def save_favorites(favorites: list[str]) -> None:
+    clean = sorted({normalize_symbol(item) for item in favorites if item})
+    FAVORITES_PATH.write_text(json.dumps(clean, indent=2))
+
+
+def get_default_journal() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"symbol": "BTCUSDT", "direction": "Long", "outcome": "Win", "pnl": "+1.8%", "date": "2026-10-28"},
+            {"symbol": "ETHUSDT", "direction": "Short", "outcome": "Loss", "pnl": "-0.4%", "date": "2026-10-27"},
+            {"symbol": "SOLUSDT", "direction": "Long", "outcome": "Win", "pnl": "+1.1%", "date": "2026-10-26"},
+            {"symbol": "NVDA", "direction": "Long", "outcome": "Win", "pnl": "+0.9%", "date": "2026-10-25"},
+        ]
+    )
 
 
 @st.cache_data(ttl=60)
@@ -32,21 +64,23 @@ def fetch_coingecko() -> pd.DataFrame:
         "per_page": 250,
     }
 
-    response = requests.get(url, params=params, timeout=20)
-    if not response.ok:
-        raise RuntimeError(f"CoinGecko request failed: {response.status_code}")
+    try:
+        response = requests.get(url, params=params, timeout=20)
+        if not response.ok:
+            return pd.DataFrame()
+        data = response.json()
+    except requests.RequestException:
+        return pd.DataFrame()
 
-    data = response.json()
     if not data:
         return pd.DataFrame()
 
+    required = ["symbol", "name", "current_price", "price_change_percentage_24h", "market_cap", "total_volume"]
     df = pd.DataFrame(data)
-    columns = ["symbol", "name", "current_price", "price_change_percentage_24h", "market_cap", "total_volume"]
-    missing = [col for col in columns if col not in df.columns]
-    if missing:
+    if not set(required).issubset(df.columns):
         return pd.DataFrame()
 
-    out = df[columns].copy()
+    out = df[required].copy()
     out["symbol"] = out["symbol"].str.upper()
     out = out.rename(
         columns={
@@ -63,14 +97,17 @@ def fetch_coingecko() -> pd.DataFrame:
 @st.cache_data(ttl=60)
 def fetch_binance() -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    base_url = "https://api.binance.com/api/v3/ticker/24hr"
+    url = "https://api.binance.com/api/v3/ticker/24hr"
 
     for symbol in BINANCE_SYMBOLS:
-        response = requests.get(base_url, params={"symbol": symbol}, timeout=20)
-        if not response.ok:
+        try:
+            response = requests.get(url, params={"symbol": symbol}, timeout=20)
+            if not response.ok:
+                continue
+            payload = response.json()
+        except requests.RequestException:
             continue
 
-        payload = response.json()
         rows.append(
             {
                 "symbol": normalize_symbol(payload.get("symbol", symbol)),
@@ -91,12 +128,7 @@ def fetch_binance() -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def fetch_market_snapshot() -> pd.DataFrame:
-    frames = []
-
-    for frame in (fetch_coingecko(), fetch_binance()):
-        if not frame.empty:
-            frames.append(frame)
-
+    frames = [frame for frame in (fetch_coingecko(), fetch_binance()) if not frame.empty]
     if not frames:
         return pd.DataFrame()
 
@@ -104,53 +136,36 @@ def fetch_market_snapshot() -> pd.DataFrame:
     market = market.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
     market["symbol"] = market["symbol"].str.upper()
 
-    for col in ["price", "change_pct", "market_cap", "volume"]:
-        if col in market.columns:
-            market[col] = pd.to_numeric(market[col], errors="coerce").fillna(0.0)
+    for column in ["price", "change_pct", "market_cap", "volume"]:
+        if column in market.columns:
+            market[column] = pd.to_numeric(market[column], errors="coerce").fillna(0.0)
 
     return market
 
 
-@st.cache_data(ttl=60)
-def fetch_market_summary() -> dict[str, Any]:
-    market = fetch_market_snapshot()
-    if market.empty:
-        return {"market_mood": "neutral", "avg_score": 0.0, "long_short_ratio": 1.0}
+def compute_score(change_pct: float, volume: float, is_favorite: bool) -> int:
+    trend_component = clamp((change_pct + 6.0) * 8.0, 0.0, 100.0)
+    momentum_component = clamp(abs(change_pct) * 10.0 + 20.0, 0.0, 100.0)
+    volume_component = clamp((volume / 1_500_000_000.0) * 100.0, 0.0, 100.0)
+    favorite_boost = 10.0 if is_favorite else 0.0
 
-    avg_change = float(market["change_pct"].mean())
-    mood = "bullish" if avg_change > 0 else "bearish" if avg_change < 0 else "neutral"
-    avg_score = float(market["setup_score"].mean()) if "setup_score" in market.columns else 0.0
-    return {
-        "market_mood": mood,
-        "avg_score": round(avg_score, 1),
-        "long_short_ratio": round(float((market["direction"].eq("long").sum() / max(1, market["direction"].eq("short").sum()))), 2),
-    }
+    score = (trend_component * 0.36) + (momentum_component * 0.26) + (volume_component * 0.22) + favorite_boost
+    return int(clamp(score, 35.0, 98.0))
 
 
-def build_setup_table(market: pd.DataFrame) -> pd.DataFrame:
+def build_setup_table(market: pd.DataFrame, favorites: list[str]) -> pd.DataFrame:
     if market.empty:
         return pd.DataFrame(columns=["symbol", "name", "direction", "setup_type", "score", "rr", "rationale", "heatmap_context"])
 
     rows: list[dict[str, Any]] = []
+    favorite_set = {normalize_symbol(symbol) for symbol in favorites}
 
     for index, row in market.iterrows():
+        symbol = normalize_symbol(row.get("symbol", ""))
         change = float(row.get("change_pct", 0.0) or 0.0)
         volume = float(row.get("volume", 0.0) or 0.0)
-
-        trend_component = clamp((change + 6.0) * 8.0, 0.0, 100.0)
-        liquidity_component = clamp(abs(change) * 12.0 + 45.0, 15.0, 98.0)
-        volume_component = clamp((volume / 1_500_000_000.0) * 100.0, 0.0, 100.0)
-        favorite_boost = 8.0 if row.get("symbol", "").upper() in FAVORITES else 0.0
-
-        raw_score = (
-            trend_component * 0.24
-            + liquidity_component * 0.18
-            + volume_component * 0.17
-            + clamp(abs(change) * 10.0, 0.0, 100.0) * 0.14
-            + favorite_boost
-        )
-
-        score = int(clamp(raw_score, 42.0, 98.0))
+        is_favorite = symbol in favorite_set
+        score = compute_score(change, volume, is_favorite)
         direction = "long" if change >= 0 else "short"
 
         if change > 2.5:
@@ -162,72 +177,67 @@ def build_setup_table(market: pd.DataFrame) -> pd.DataFrame:
         else:
             setup_type = "trend-follow"
 
-        risk_pct = 0.85 if row.get("symbol", "").upper().endswith("USDT") else 0.7
+        risk_pct = 0.85 if symbol.endswith("USDT") else 0.7
         entry = float(row.get("price", 0.0) or 0.0)
         stop = round(entry * (1 - risk_pct / 100.0) if direction == "long" else entry * (1 + risk_pct / 100.0), 4)
         target = round(entry * (1 + 2.5 * risk_pct / 100.0) if direction == "long" else entry * (1 - 2.3 * risk_pct / 100.0), 4)
         rr = round(abs(target - entry) / max(abs(entry - stop), 0.0001), 2)
 
-        if setup_type == "breakout":
-            rationale = "Breakout confirmation is visible with strong momentum and higher-than-normal trade activity."
-        elif setup_type == "pullback":
-            rationale = "Price is re-entering support while momentum remains healthy for continuation."
-        elif setup_type == "range-break":
-            rationale = "Range expansion is active and price is moving decisively through recent congestion."
-        else:
-            rationale = "Trend structure is intact and the setup has improving breadth across the market."
+        rationale_map = {
+            "breakout": "Breakout confirmation is visible with strong momentum and healthier-than-average participation.",
+            "momentum": "Momentum remains encouraging, with price continuing to build a stronger trend structure.",
+            "pullback": "Price is re-entering support while directional bias stays intact for continuation.",
+            "range-break": "Volatility is expanding and the market is pushing decisively through local range limits.",
+            "trend-follow": "Trend structure remains constructive and the setup still carries favorable breadth.",
+        }
 
         heatmap_context = (
-            "Liquidity is stacking around the active zone with pressure building around the near-term support." 
-            if row.get("symbol", "").upper().endswith("USDT")
-            else "Liquidity remains stable around the current price area with support holding firm."
+            "Liquidity is stacking around the active zone with support absorbing short-lived pressure."
+            if symbol.endswith("USDT")
+            else "Price remains stable near current support and liquidity is still constructive."
         )
 
         rows.append(
             {
-                "symbol": row.get("symbol", ""),
-                "name": row.get("name", row.get("symbol", "")),
+                "symbol": symbol,
+                "name": row.get("name", symbol),
                 "direction": direction,
                 "setup_type": setup_type,
                 "score": score,
                 "rr": rr,
-                "rationale": rationale,
+                "rationale": rationale_map.get(setup_type, rationale_map["trend-follow"]),
                 "heatmap_context": heatmap_context,
             }
         )
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "name", "direction", "setup_type", "score", "rr", "rationale", "heatmap_context"])
 
-    return df.sort_values("score", ascending=False).reset_index(drop=True)
+    frame = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    return frame
 
 
 @st.cache_resource
-def ollama_available() -> bool:
+def check_ollama() -> bool:
     try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
+        response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
         return response.ok
     except requests.RequestException:
         return False
 
 
 def call_ollama(prompt: str) -> str | None:
-    if not ollama_available():
+    if not check_ollama():
         return None
 
-    payload = {
-        "model": "llama3",
-        "prompt": prompt,
-        "stream": False,
-    }
-
+    payload = {"model": "llama3", "prompt": prompt, "stream": False}
     try:
-        response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=30)
+        response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=30)
         if not response.ok:
             return None
         result = response.json()
-        return result.get("response", "").strip()
+        text = result.get("response", "").strip()
+        return text or None
     except requests.RequestException:
         return None
 
@@ -238,19 +248,15 @@ def call_gemini(prompt: str) -> str | None:
         return None
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2},
-    }
-
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         response = requests.post(url, json=payload, timeout=30)
         if not response.ok:
             return None
-
         result = response.json()
-        text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
-        return text.strip() if text else None
+        candidate = result.get("candidates", [{}])[0]
+        text = candidate.get("content", {}).get("parts", [{"text": ""}])[0].get("text", "").strip()
+        return text or None
     except requests.RequestException:
         return None
 
@@ -273,34 +279,41 @@ def call_venice(prompt: str) -> str | None:
         if not response.ok:
             return None
         result = response.json()
-        return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
     except requests.RequestException:
         return None
 
 
-def generate_ai_summary(market: pd.DataFrame, setups: pd.DataFrame) -> str:
-    top_assets = setups.head(3).to_dict(orient="records")
-    text = json.dumps({
-        "market": {
-            "count": len(market),
-            "mood": "bullish" if (market["change_pct"].mean() >= 0) else "bearish",
-            "average_change": round(float(market["change_pct"].mean()), 2),
-        },
-        "top_setups": top_assets,
-    }, default=str)
+def generate_ai_summary(market: pd.DataFrame, setups: pd.DataFrame, ai_mode: str) -> str:
+    if ai_mode == "manual":
+        return "AI summary is disabled. Manual review is active for this run."
 
+    top_assets = setups.head(3).to_dict(orient="records")
+    market_summary = {
+        "market_count": len(market),
+        "average_change": round(float(market["change_pct"].mean()), 2),
+        "mood": "bullish" if float(market["change_pct"].mean()) >= 0 else "bearish",
+        "top_setups": top_assets,
+    }
     prompt = (
-        "You are a trading analyst. Summarize the market in 3 short paragraphs. "
-        "Focus on risk, momentum, and setup quality. Keep it practical and concise.\n\n"
-        f"Data: {text}"
+        "You are a trading analyst. Summarize the current market in 3 short paragraphs. "
+        "Focus on trend, risk, and setup quality. Do not mention that you are an AI. Keep it concise and actionable.\n\n"
+        f"Data: {json.dumps(market_summary, default=str)}"
     )
 
-    for provider in (call_ollama, call_gemini, call_venice):
+    provider_order = {
+        "auto": (call_ollama, call_gemini, call_venice),
+        "ollama": (call_ollama,),
+        "gemini": (call_gemini,),
+        "venice": (call_venice,),
+    }
+
+    for provider in provider_order.get(ai_mode, provider_order["auto"]):
         response = provider(prompt)
         if response:
             return response
 
-    return "AI summary unavailable: no local Ollama or free cloud model is configured. Use the dashboard as a manual trading decision tool."
+    return "AI summary unavailable: no local model or free cloud fallback is active. The app is running in manual-analysis mode."
 
 
 def render_heatmap(setups: pd.DataFrame) -> None:
@@ -308,8 +321,8 @@ def render_heatmap(setups: pd.DataFrame) -> None:
         st.info("No setup data available.")
         return
 
-    cols = st.columns(10)
-    for idx, row in enumerate(setups.head(10).itertuples(index=False)):
+    cells = []
+    for row in setups.head(12).itertuples(index=False):
         score = int(getattr(row, "score", 50))
         if score >= 80:
             color = "#22c55e"
@@ -317,43 +330,95 @@ def render_heatmap(setups: pd.DataFrame) -> None:
             color = "#f59e0b"
         else:
             color = "#38bdf8"
+        cells.append((row.symbol, color, score))
 
-        with cols[idx % 10]:
+    cols = st.columns(6)
+    for idx, (symbol, color, score) in enumerate(cells):
+        with cols[idx % 6]:
             st.markdown(
-                f'<div style="background:{color};height:28px;border-radius:8px;opacity:0.9;margin:2px 0;width:100%"></div>',
+                f'<div style="background:{color};height:32px;border-radius:10px;opacity:0.9;margin:3px 0;width:100%"></div>',
                 unsafe_allow_html=True,
             )
-            st.caption(f"{row.symbol}")
+            st.caption(f"{symbol} {score}")
+
+
+def create_rendered_journal() -> pd.DataFrame:
+    existing = st.session_state.get("journal_df")
+    if existing is not None:
+        return existing
+    return get_default_journal()
 
 
 def main() -> None:
-    st.title("Claude Trading Bot")
-    st.caption("Free/public mode: CoinGecko + Binance public endpoints + local Ollama as the default AI backend.")
+    if "journal_df" not in st.session_state:
+        st.session_state.journal_df = get_default_journal()
 
     with st.sidebar:
         st.header("Controls")
-        mode = st.radio("Asset view", ["All assets", "Favorites only"], index=0)
-        st.caption("Best free/default providers: CoinGecko, Binance, Yahoo fallback, Ollama")
-        st.caption("Optional providers: Gemini, Venice, Finnhub, Alpha Vantage")
+        view_mode = st.radio("Asset view", ["All assets", "Favorites only"], index=0)
+
+        has_ollama = check_ollama()
+        has_gemini = bool(os.getenv("GEMINI_API_KEY"))
+        has_venice = bool(os.getenv("VENICE_API_KEY"))
+
+        ai_choices = ["manual"]
+        if has_ollama:
+            ai_choices.insert(0, "ollama")
+        if has_gemini:
+            ai_choices.insert(0, "gemini")
+        if has_venice:
+            ai_choices.insert(0, "venice")
+        if not ai_choices or ai_choices[0] == "manual":
+            ai_choices = ["manual", "auto"]
+        else:
+            ai_choices = ["auto"] + ai_choices
+
+        ai_mode = st.selectbox("AI mode", list(dict.fromkeys(ai_choices)), index=0)
+        refresh_seconds = st.selectbox("Refresh interval", [15, 30, 60, 120], index=2)
+        st.caption("Free/public default: CoinGecko + Binance public API + local Ollama only when available")
+
+        favorites = load_favorites()
+        st.subheader("Favorites")
+        selected_symbol = st.selectbox("Add favorite", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "NVDA", "AAPL", "MSFT"], index=0)
+        if st.button("Add to favorites"):
+            if selected_symbol not in favorites:
+                favorites.append(normalize_symbol(selected_symbol))
+                save_favorites(favorites)
+                st.rerun()
+
+        if favorites:
+            st.write("Current favorites:")
+            for symbol in favorites:
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.caption(symbol)
+                with col2:
+                    if st.button("x", key=f"remove-{symbol}"):
+                        favorites = [item for item in favorites if item != symbol]
+                        save_favorites(favorites)
+                        st.rerun()
 
     market = fetch_market_snapshot()
     if market.empty:
-        st.error("No market data could be loaded. Check your internet connection or public endpoint availability.")
+        st.error("No public market data was returned. The app is running in free/public mode and may need a moment to reconnect.")
         return
 
-    favorite_only = mode == "Favorites only"
-    if favorite_only:
-        market = market[market["symbol"].isin({normalize_symbol(s) for s in FAVORITES})].copy()
+    favorites = load_favorites()
+    if view_mode == "Favorites only":
+        market = market[market["symbol"].isin({normalize_symbol(symbol) for symbol in favorites})].copy()
 
-    setups = build_setup_table(market)
+    setups = build_setup_table(market, favorites)
     if setups.empty:
-        st.warning("No setups generated for the current selection.")
+        st.warning("No setups were produced for the current selection.")
         return
 
-    avg_change = float(market["change_pct"].mean())
     average_score = float(setups["score"].mean())
+    avg_change = float(market["change_pct"].mean())
     mood = "bullish" if avg_change >= 0 else "bearish"
     long_short_ratio = round(float((setups["direction"].eq("long").sum() / max(1, setups["direction"].eq("short").sum()))), 2)
+
+    st.title("Claude Trading Bot")
+    st.caption("Free/public mode: CoinGecko + Binance public endpoints. Optional upgrades: Gemini / Venice / Finnhub / Alpha Vantage.")
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Avg setup score", f"{round(average_score, 1)}/100")
@@ -361,24 +426,20 @@ def main() -> None:
     col3.metric("Market mood", mood)
     col4.metric("Tracked assets", len(market))
 
-    ai_summary = generate_ai_summary(market, setups)
+    ai_summary = generate_ai_summary(market, setups, ai_mode)
     st.markdown("### AI market summary")
     st.info(ai_summary)
 
     st.markdown("### Best setups")
-    st.dataframe(
-        setups[["symbol", "name", "direction", "setup_type", "score", "rr", "rationale"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(setups[["symbol", "name", "direction", "setup_type", "score", "rr", "rationale"]], use_container_width=True, hide_index=True)
 
     st.markdown("### Liquidity & liquidation heatmap")
     render_heatmap(setups)
 
     st.markdown("### Favorite assets")
-    favorite_assets = market[market["symbol"].isin({normalize_symbol(s) for s in FAVORITES})].copy()
+    favorite_assets = market[market["symbol"].isin({normalize_symbol(symbol) for symbol in favorites})].copy()
     if favorite_assets.empty:
-        st.caption("No favorites in this filtered view.")
+        st.caption("No favorites in the current selection.")
     else:
         st.dataframe(
             favorite_assets[["symbol", "name", "price", "change_pct", "volume"]].sort_values("change_pct", ascending=False),
@@ -387,15 +448,16 @@ def main() -> None:
         )
 
     st.markdown("### Trade journal")
-    journal = pd.DataFrame(
-        [
-            {"symbol": "BTCUSDT", "direction": "Long", "outcome": "Win", "pnl": "+1.8%", "date": "2026-10-28"},
-            {"symbol": "ETHUSDT", "direction": "Short", "outcome": "Loss", "pnl": "-0.4%", "date": "2026-10-27"},
-            {"symbol": "SOLUSDT", "direction": "Long", "outcome": "Win", "pnl": "+1.1%", "date": "2026-10-26"},
-            {"symbol": "NVDA", "direction": "Long", "outcome": "Win", "pnl": "+0.9%", "date": "2026-10-25"},
-        ]
-    )
-    st.dataframe(journal, use_container_width=True, hide_index=True)
+    journal = create_rendered_journal()
+    edited = st.data_editor(journal, use_container_width=True, hide_index=True, num_rows="dynamic")
+    st.session_state.journal_df = edited
+
+    csv_bytes = edited.to_csv(index=False).encode("utf-8")
+    st.download_button("Export journal CSV", data=csv_bytes, file_name="trade_journal.csv", mime="text/csv")
+
+    if st.button("Reset journal"):
+        st.session_state.journal_df = get_default_journal()
+        st.rerun()
 
 
 if __name__ == "__main__":
