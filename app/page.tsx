@@ -9,7 +9,7 @@ export default async function HomePage({
   searchParams?: { mode?: string };
 }) {
   const mode = searchParams?.mode === 'favorites' ? 'favorites' : 'all';
-  const { summary, setups, instruments } = await getMarketSnapshot(mode);
+  const { summary, setups, instruments, providers } = await getMarketSnapshot(mode);
 
   return (
     <div className="space-y-6">
@@ -23,7 +23,12 @@ export default async function HomePage({
         </div>
       </div>
 
-      <FilterTabs activeMode={mode} />
+      <div className="flex flex-wrap items-center gap-3">
+        <FilterTabs activeMode={mode} />
+        <div className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-200">
+          Provider mode: {providers.mode}
+        </div>
+      </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="Average setup score" value={`${summary.avgSetupScore}/100`} tone="sky" />
