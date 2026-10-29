@@ -2,8 +2,12 @@ import { generateSetupScores } from '@/services/scoring/setup-engine';
 import { instruments as defaultInstruments, tradeHistory as defaultTrades, marketSummary as defaultSummary } from '@/lib/mock-data';
 import { runDailyLearningLoop } from '@/services/learning/daily-loop';
 
-export async function getMarketSnapshot() {
-  const instruments = defaultInstruments;
+export async function getMarketSnapshot(mode: 'all' | 'favorites' = 'all') {
+  const instruments = defaultInstruments.filter((instrument) => {
+    if (mode === 'favorites') return instrument.favorite === true;
+    return true;
+  });
+
   const setups = generateSetupScores(instruments);
   const learning = runDailyLearningLoop(setups, defaultTrades);
 
