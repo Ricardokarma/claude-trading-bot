@@ -158,7 +158,7 @@ def build_setup_table(market: pd.DataFrame, favorites: list[str]) -> pd.DataFram
         return pd.DataFrame(columns=["symbol", "name", "direction", "setup_type", "score", "rr", "rationale", "heatmap_context"])
 
     rows: list[dict[str, Any]] = []
-    favorite_set = {normalize_symbol(symbol) for symbol in favorites}
+    favorite_set = {normalize_symbol(item) for item in favorites}
 
     for index, row in market.iterrows():
         symbol = normalize_symbol(row.get("symbol", ""))
@@ -213,8 +213,7 @@ def build_setup_table(market: pd.DataFrame, favorites: list[str]) -> pd.DataFram
     if not rows:
         return pd.DataFrame(columns=["symbol", "name", "direction", "setup_type", "score", "rr", "rationale", "heatmap_context"])
 
-    frame = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
-    return frame
+    return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
 
 
 @st.cache_resource
@@ -236,8 +235,35 @@ def call_ollama(prompt: str) -> str | None:
         if not response.ok:
             return None
         result = response.json()
-        text = result.get("response", "").strip()
-        return text or None
+        return result.get("response", "").strip() or None
+    except requests.RequestException:
+        return None
+
+
+def call_kimi(prompt: str) -> str | None:
+    api_key = os.getenv("KIMI_API_KEY")
+    if not api_key:
+        return None
+
+    url = "https://api.moonshot.cn/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "moonshot-v1-8k",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 350,
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        if not response.ok:
+            return None
+        data = response.json()
+        message = data.get("choices", [{}])[0].get("message", {})
+        return message.get("content", "").strip() or None
     except requests.RequestException:
         return None
 
@@ -249,13 +275,15 @@ def call_gemini(prompt: str) -> str | None:
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
     try:
         response = requests.post(url, json=payload, timeout=30)
         if not response.ok:
             return None
         result = response.json()
         candidate = result.get("candidates", [{}])[0]
-        text = candidate.get("content", {}).get("parts", [{"text": ""}])[0].get("text", "").strip()
+        parts = candidate.get("content", {}).get("parts", [{"text": ""}])
+        text = parts[0].get("text", "").strip()
         return text or None
     except requests.RequestException:
         return None
@@ -279,7 +307,8 @@ def call_venice(prompt: str) -> str | None:
         if not response.ok:
             return None
         result = response.json()
-        return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
+        message = result.get("choices", [{}])[0].get("message", {})
+        return message.get("content", "").strip() or None
     except requests.RequestException:
         return None
 
@@ -295,15 +324,17 @@ def generate_ai_summary(market: pd.DataFrame, setups: pd.DataFrame, ai_mode: str
         "mood": "bullish" if float(market["change_pct"].mean()) >= 0 else "bearish",
         "top_setups": top_assets,
     }
+
     prompt = (
         "You are a trading analyst. Summarize the current market in 3 short paragraphs. "
-        "Focus on trend, risk, and setup quality. Do not mention that you are an AI. Keep it concise and actionable.\n\n"
+        "Focus on trend, risk, and setup quality. Keep it practical and concise.\n\n"
         f"Data: {json.dumps(market_summary, default=str)}"
     )
 
     provider_order = {
-        "auto": (call_ollama, call_gemini, call_venice),
+        "auto": (call_ollama, call_kimi, call_gemini, call_venice),
         "ollama": (call_ollama,),
+        "kimi": (call_kimi,),
         "gemini": (call_gemini,),
         "venice": (call_venice,),
     }
@@ -321,7 +352,7 @@ def render_heatmap(setups: pd.DataFrame) -> None:
         st.info("No setup data available.")
         return
 
-    cells = []
+    cells: list[tuple[str, str, int]] = []
     for row in setups.head(12).itertuples(index=False):
         score = int(getattr(row, "score", 50))
         if score >= 80:
@@ -342,13 +373,6 @@ def render_heatmap(setups: pd.DataFrame) -> None:
             st.caption(f"{symbol} {score}")
 
 
-def create_rendered_journal() -> pd.DataFrame:
-    existing = st.session_state.get("journal_df")
-    if existing is not None:
-        return existing
-    return get_default_journal()
-
-
 def main() -> None:
     if "journal_df" not in st.session_state:
         st.session_state.journal_df = get_default_journal()
@@ -357,29 +381,29 @@ def main() -> None:
         st.header("Controls")
         view_mode = st.radio("Asset view", ["All assets", "Favorites only"], index=0)
 
-        has_ollama = check_ollama()
-        has_gemini = bool(os.getenv("GEMINI_API_KEY"))
-        has_venice = bool(os.getenv("VENICE_API_KEY"))
-
-        ai_choices = ["manual"]
-        if has_ollama:
-            ai_choices.insert(0, "ollama")
-        if has_gemini:
-            ai_choices.insert(0, "gemini")
-        if has_venice:
-            ai_choices.insert(0, "venice")
-        if not ai_choices or ai_choices[0] == "manual":
-            ai_choices = ["manual", "auto"]
-        else:
-            ai_choices = ["auto"] + ai_choices
+        ai_choices = ["manual", "auto"]
+        if check_ollama():
+            ai_choices.insert(1, "ollama")
+        if os.getenv("KIMI_API_KEY"):
+            ai_choices.insert(1, "kimi")
+        if os.getenv("GEMINI_API_KEY"):
+            ai_choices.insert(1, "gemini")
+        if os.getenv("VENICE_API_KEY"):
+            ai_choices.insert(1, "venice")
 
         ai_mode = st.selectbox("AI mode", list(dict.fromkeys(ai_choices)), index=0)
-        refresh_seconds = st.selectbox("Refresh interval", [15, 30, 60, 120], index=2)
-        st.caption("Free/public default: CoinGecko + Binance public API + local Ollama only when available")
+        st.caption("Public-safe default: no local-only dependency is assumed.")
+        st.caption("Optional providers: Kimi, Gemini, Venice, Ollama if reachable.")
 
         favorites = load_favorites()
         st.subheader("Favorites")
-        selected_symbol = st.selectbox("Add favorite", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "NVDA", "AAPL", "MSFT"], index=0)
+
+        selected_symbol = st.selectbox(
+            "Add favorite",
+            ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "NVDA", "AAPL", "MSFT"],
+            index=0,
+        )
+
         if st.button("Add to favorites"):
             if selected_symbol not in favorites:
                 favorites.append(normalize_symbol(selected_symbol))
@@ -389,10 +413,10 @@ def main() -> None:
         if favorites:
             st.write("Current favorites:")
             for symbol in favorites:
-                col1, col2 = st.columns([4, 1])
-                with col1:
+                col_a, col_b = st.columns([4, 1])
+                with col_a:
                     st.caption(symbol)
-                with col2:
+                with col_b:
                     if st.button("x", key=f"remove-{symbol}"):
                         favorites = [item for item in favorites if item != symbol]
                         save_favorites(favorites)
@@ -400,25 +424,25 @@ def main() -> None:
 
     market = fetch_market_snapshot()
     if market.empty:
-        st.error("No public market data was returned. The app is running in free/public mode and may need a moment to reconnect.")
+        st.error("No public market data was returned. The app is running in public-safe mode and may need a few moments to reconnect.")
         return
 
     favorites = load_favorites()
     if view_mode == "Favorites only":
-        market = market[market["symbol"].isin({normalize_symbol(symbol) for symbol in favorites})].copy()
+        market = market[market["symbol"].isin({normalize_symbol(item) for item in favorites})].copy()
 
     setups = build_setup_table(market, favorites)
     if setups.empty:
         st.warning("No setups were produced for the current selection.")
         return
 
-    average_score = float(setups["score"].mean())
     avg_change = float(market["change_pct"].mean())
+    average_score = float(setups["score"].mean())
     mood = "bullish" if avg_change >= 0 else "bearish"
     long_short_ratio = round(float((setups["direction"].eq("long").sum() / max(1, setups["direction"].eq("short").sum()))), 2)
 
     st.title("Claude Trading Bot")
-    st.caption("Free/public mode: CoinGecko + Binance public endpoints. Optional upgrades: Gemini / Venice / Finnhub / Alpha Vantage.")
+    st.caption("Free/public mode: CoinGecko + Binance public endpoints. Optional upgrade: Kimi / Gemini / Venice / Ollama when available.")
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Avg setup score", f"{round(average_score, 1)}/100")
@@ -431,25 +455,29 @@ def main() -> None:
     st.info(ai_summary)
 
     st.markdown("### Best setups")
-    st.dataframe(setups[["symbol", "name", "direction", "setup_type", "score", "rr", "rationale"]], use_container_width=True, hide_index=True)
+    st.dataframe(
+        setups[["symbol", "name", "direction", "setup_type", "score", "rr", "rationale"]],
+        width="stretch",
+        hide_index=True,
+    )
 
     st.markdown("### Liquidity & liquidation heatmap")
     render_heatmap(setups)
 
     st.markdown("### Favorite assets")
-    favorite_assets = market[market["symbol"].isin({normalize_symbol(symbol) for symbol in favorites})].copy()
+    favorite_assets = market[market["symbol"].isin({normalize_symbol(item) for item in favorites})].copy()
     if favorite_assets.empty:
         st.caption("No favorites in the current selection.")
     else:
         st.dataframe(
             favorite_assets[["symbol", "name", "price", "change_pct", "volume"]].sort_values("change_pct", ascending=False),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
     st.markdown("### Trade journal")
-    journal = create_rendered_journal()
-    edited = st.data_editor(journal, use_container_width=True, hide_index=True, num_rows="dynamic")
+    journal = st.session_state.journal_df
+    edited = st.data_editor(journal, width="stretch", hide_index=True, num_rows="dynamic")
     st.session_state.journal_df = edited
 
     csv_bytes = edited.to_csv(index=False).encode("utf-8")
